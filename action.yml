@@ -1,0 +1,88 @@
+name: Healkite
+description: Publish an over-the-air update with Healkite (guarded or scheduled), or check the bundle size on pull requests.
+branding:
+  icon: upload-cloud
+  color: blue
+inputs:
+  mode: { description: "release (publish), size-check (compare with the latest release; publishes nothing), preview (publish this PR to a preview channel and comment the link), or preview-close", required: false, default: release }
+  api-url: { description: Healkite API URL, required: true }
+  token: { description: "Healkite access key (store as a secret). Developer role for release; Viewer is enough for size-check.", required: true }
+  channel: { description: Channel key, required: true }
+  platform: { description: ios | android, required: true }
+  runtime-version: { description: Binary/runtime version the bundle targets, required: true }
+  signing-key: { description: PEM of your ECDSA P-256 signing key (store as a secret), required: false }
+  guarded: { description: "true to roll out as a Guarded Release", required: false, default: "false" }
+  description: { description: Release notes, required: false }
+  starts-at: { description: "Go live later: +2h, 2026-11-20 00:00, or an ISO time", required: false }
+  ends-at: { description: "Campaign end: the release turns itself off and devices return to the previous one", required: false }
+  max-size: { description: "Fail if the bundle is bigger, e.g. 2MB", required: false }
+  max-growth: { description: "Fail if the bundle grew more than this % vs the latest release, e.g. 10", required: false }
+  project: { description: React Native project directory, required: false, default: "." }
+  preview-name: { description: "Preview name (default pr-<number>)", required: false }
+  github-token: { description: "Token to comment on the pull request (preview modes)", required: false, default: "${{ github.token }}" }
+outputs:
+  size-summary: { description: "One line, e.g. Bundle 520.0 KB (+20.0 KB, +4.0% vs v4)", value: "${{ steps.healkite.outputs.summary }}" }
+runs:
+  using: composite
+  steps:
+    - id: healkite
+      shell: bash
+      # Inputs travel as environment variables (never interpolated into the script) to avoid injection.
+      env:
+        HEALKITE_API_URL: ${{ inputs.api-url }}
+        HEALKITE_TOKEN: ${{ inputs.token }}
+        HEALKITE_SIGNING_KEY: ${{ inputs.signing-key }}
+        HK_MODE: ${{ inputs.mode }}
+        HK_CHANNEL: ${{ inputs.channel }}
+        HK_PLATFORM: ${{ inputs.platform }}
+        HK_RUNTIME: ${{ inputs.runtime-version }}
+        HK_GUARDED: ${{ inputs.guarded }}
+        HK_DESCRIPTION: ${{ inputs.description }}
+        HK_STARTS_AT: ${{ inputs.starts-at }}
+        HK_ENDS_AT: ${{ inputs.ends-at }}
+        HK_MAX_SIZE: ${{ inputs.max-size }}
+        HK_MAX_GROWTH: ${{ inputs.max-growth }}
+        HK_PROJECT: ${{ inputs.project }}
+        HK_PREVIEW_NAME: ${{ inputs.preview-name }}
+        HK_PR: ${{ github.event.pull_request.number }}
+        HK_PR_TITLE: ${{ github.event.pull_request.title }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        budget=()
+        [ -n "$HK_MAX_SIZE" ] && budget+=(--max-size "$HK_MAX_SIZE")
+        [ -n "$HK_MAX_GROWTH" ] && budget+=(--max-growth "$HK_MAX_GROWTH")
+        if [ "$HK_MODE" = "size-check" ]; then
+          set +e
+          out=$(npx --yes healkite@latest size -p "$HK_PLATFORM" -c "$HK_CHANNEL" -r "$HK_RUNTIME" --project "$HK_PROJECT" --json ${budget[@]+"${budget[@]}"})
+          code=$?
+          set -e
+          summary=$(node -e 'const r=JSON.parse(process.argv[1]);console.log(r.summary + (r.problems.length ? " — " + r.problems.join("; ") : ""))' "$out")
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          { echo "### Healkite bundle size"; echo; echo "$summary"; } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+        fi
+        if [ "$HK_MODE" = "preview" ] || [ "$HK_MODE" = "preview-close" ]; then
+          name="${HK_PREVIEW_NAME:-pr-$HK_PR}"
+          if [ "$HK_MODE" = "preview-close" ]; then
+            npx --yes healkite@latest preview --close --from "$HK_CHANNEL" --name "$name" -p "$HK_PLATFORM" -r "$HK_RUNTIME"
+            exit 0
+          fi
+          out=$(npx --yes healkite@latest preview --from "$HK_CHANNEL" --name "$name" -p "$HK_PLATFORM" -r "$HK_RUNTIME" --project "$HK_PROJECT" -d "$HK_PR_TITLE" --json)
+          echo "$out"
+          link=$(node -e 'const r=JSON.parse(process.argv[1]);console.log(r.link||r.deepLink||"")' "$out")
+          echo "summary=Preview $name: $link" >> "$GITHUB_OUTPUT"
+          body=$(printf '### 📱 Healkite preview (%s)\n\nTry this PR on the store build: open **[%s](%s)** on your phone (or scan the QR code there) with the app installed.\n\n<sub>Updated on every push. Closes when the PR closes.</sub>' "$HK_PLATFORM" "$name" "$link")
+          if [ -n "$HK_PR" ] && command -v gh >/dev/null; then
+            gh pr comment "$HK_PR" --edit-last --body "$body" 2>/dev/null || gh pr comment "$HK_PR" --body "$body"
+          fi
+          { echo "### Healkite preview"; echo; echo "$link"; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        args=(release -p "$HK_PLATFORM" -c "$HK_CHANNEL" -r "$HK_RUNTIME" --project "$HK_PROJECT" ${budget[@]+"${budget[@]}"})
+        [ -n "$HK_DESCRIPTION" ] && args+=(-d "$HK_DESCRIPTION")
+        [ "$HK_GUARDED" = "true" ] && args+=(--guarded)
+        [ -n "$HK_STARTS_AT" ] && args+=(--at "$HK_STARTS_AT")
+        [ -n "$HK_ENDS_AT" ] && args+=(--until "$HK_ENDS_AT")
+        npx --yes healkite@latest "${args[@]}"
